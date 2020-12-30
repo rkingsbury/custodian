@@ -43,10 +43,9 @@ class QCJob(Job):
         output_file="mol.qout",
         qclog_file="mol.qclog",
         suffix="",
-        scratch_dir=os.getcwd(),
+        calc_loc=None,
         save_scratch=False,
-        save_name="saved_scratch",
-        backup=True,
+        backup=True
     ):
         """
         Args:
@@ -58,11 +57,10 @@ class QCJob(Job):
             qclog_file (str): Name of the file to redirect the standard output
                 to. None means not to record the standard output.
             suffix (str): String to append to the file in postprocess.
-            scratch_dir (str): QCSCRATCH directory. Defaults to current directory.
-            save_scratch (bool): Whether to save basic scratch directory contents.
+            calc_loc (str): Path where Q-Chem should run. Defaults to None, in
+                which case Q-Chem will run in the system-defined QCLOCALSCR.
+            save_scratch (bool): Whether to save full scratch directory contents.
                 Defaults to False.
-            save_name (str): Name of the saved scratch directory. Defaults to
-                to "saved_scratch".
             backup (bool): Whether to backup the initial input file. If True, the
                 input will be copied with a ".orig" appended. Defaults to True.
         """
@@ -73,9 +71,8 @@ class QCJob(Job):
         self.max_cores = max_cores
         self.qclog_file = qclog_file
         self.suffix = suffix
-        self.scratch_dir = scratch_dir
+        self.calc_loc = calc_loc
         self.save_scratch = save_scratch
-        self.save_name = save_name
         self.backup = backup
 
     @property
@@ -88,9 +85,8 @@ class QCJob(Job):
             str(self.max_cores),
             self.input_file,
             self.output_file,
+            "scratch"
         ]
-        if self.save_scratch:
-            command.append(self.save_name)
         command = self.qchem_command + command
         com_str = ""
         for part in command:
@@ -100,16 +96,28 @@ class QCJob(Job):
     def setup(self):
         if self.backup:
             shutil.copy(self.input_file, "{}.orig".format(self.input_file))
-        os.environ["QCSCRATCH"] = self.scratch_dir
-        if self.multimode == "openmp":
-            os.environ["QCTHREADS"] = str(self.max_cores)
-            os.environ["OMP_NUM_THREADS"] = str(self.max_cores)
+        if self.multimode == 'openmp':
+            os.environ['QCTHREADS'] = str(self.max_cores)
+            os.environ['OMP_NUM_THREADS'] = str(self.max_cores)
+        os.environ["QCSCRATCH"] = os.getcwd()
+        if self.calc_loc != None:
+            os.environ["QCLOCALSCR"] = self.calc_loc
 
     def postprocess(self):
+        scratch_dir = os.path.join(os.environ["QCSCRATCH"],"scratch")
+        for file in ["HESS","GRAD","plots/dens.0.cube"]:
+            file_path = os.path.join(scratch_dir,file)
+            if os.path.exists(file_path):
+                shutil.copy(file_path,os.getcwd())
         if self.suffix != "":
             shutil.move(self.input_file, self.input_file + self.suffix)
             shutil.move(self.output_file, self.output_file + self.suffix)
             shutil.move(self.qclog_file, self.qclog_file + self.suffix)
+            for file in ["HESS","GRAD","dens.0.cube"]:
+                if os.path.exists(file):
+                    shutil.move(file, file + self.suffix)
+        if not self.save_scratch:
+            shutil.rmtree(scratch_dir)
 
     def run(self):
         """
@@ -118,11 +126,10 @@ class QCJob(Job):
         Returns:
             (subprocess.Popen) Used for monitoring.
         """
-        myrand = str(random.randint(1, 1000000000))
-        mydir = os.path.join("/tmp", "qchem" + myrand)
-        os.mkdir(mydir)
-        os.environ["QCLOCALSCR"] = mydir
-        qclog = open(self.qclog_file, "w")
+        local_scratch = os.path.join(os.environ["QCLOCALSCR"],"scratch")
+        if os.path.exists(local_scratch):
+            shutil.rmtree(local_scratch)
+        qclog = open(self.qclog_file, 'w')
         p = subprocess.Popen(self.current_command, stdout=qclog, shell=True)
         return p
 
@@ -138,6 +145,7 @@ class QCJob(Job):
         max_molecule_perturb_scale=0.3,
         check_connectivity=True,
         linked=True,
+        save_final_scratch=False,
         **QCJob_kwargs
     ):
         """
@@ -157,6 +165,9 @@ class QCJob(Job):
                 can be applied to the molecule. Defaults to 0.3.
             check_connectivity (bool): Whether to check differences in connectivity
                 introduced by structural perturbation. Defaults to True.
+            linked (bool): Whether or not to use the linked flattener. Defaults to True.
+            save_final_scratch (bool): Whether to save full scratch directory contents
+                at the end of the flattening. Defaults to False.
             **QCJob_kwargs: Passthrough kwargs to QCJob. See
                 :class:`custodian.qchem.jobs.QCJob`.
         """
@@ -185,14 +196,16 @@ class QCJob(Job):
                         output_file=output_file,
                         qclog_file=qclog_file,
                         suffix=".opt_" + str(ii),
-                        scratch_dir=os.getcwd(),
                         save_scratch=True,
-                        save_name="chain_scratch",
                         backup=first,
                         **QCJob_kwargs
                     )
                 )
                 opt_outdata = QCOutput(output_file + ".opt_" + str(ii)).data
+                opt_indata = QCInput.from_file(input_file + ".opt_" + str(ii))
+                if opt_indata.rem["scf_algorithm"] != freq_rem["scf_algorithm"]:
+                    freq_rem["scf_algorithm"] = opt_indata.rem["scf_algorithm"]
+                    opt_rem["scf_algorithm"] = opt_indata.rem["scf_algorithm"]
                 first = False
                 if (
                     opt_outdata["structure_change"] == "unconnected_fragments"
@@ -221,14 +234,16 @@ class QCJob(Job):
                             output_file=output_file,
                             qclog_file=qclog_file,
                             suffix=".freq_" + str(ii),
-                            scratch_dir=os.getcwd(),
                             save_scratch=True,
-                            save_name="chain_scratch",
                             backup=first,
                             **QCJob_kwargs
                         )
                     )
                     outdata = QCOutput(output_file + ".freq_" + str(ii)).data
+                    indata = QCInput.from_file(input_file + ".freq_" + str(ii))
+                    if indata.rem["scf_algorithm"] != freq_rem["scf_algorithm"]:
+                        freq_rem["scf_algorithm"] = indata.rem["scf_algorithm"]
+                        opt_rem["scf_algorithm"] = indata.rem["scf_algorithm"]
                     errors = outdata.get("errors")
                     if len(errors) != 0:
                         raise AssertionError(
@@ -264,8 +279,8 @@ class QCJob(Job):
                             smx=orig_input.smx,
                         )
                         opt_QCInput.write_file(input_file)
-            if os.path.exists(os.path.join(os.getcwd(), "chain_scratch")):
-                shutil.rmtree(os.path.join(os.getcwd(), "chain_scratch"))
+            if not save_final_scratch:
+                shutil.rmtree(os.path.join(os.getcwd(), "scratch"))
 
         else:
             if not os.path.exists(input_file):
